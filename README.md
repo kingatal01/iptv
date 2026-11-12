@@ -84,3 +84,12 @@ Les contributions sont les bienvenues : corrections, améliorations, nouvelles l
 
 Pistes ouvertes : sous-titres, guide des programmes, navigation complète à la télécommande sur Android TV,
 démarrage plus rapide du lecteur desktop, test sur un appareil Android 9.
+
+## Licence
+
+Le code de ce dépôt est publié sous [licence MIT](LICENSE) : vous pouvez l'utiliser, le modifier et le redistribuer
+librement, à condition de conserver la mention de copyright.
+
+Les versions installables embarquent des bibliothèques tierces qui gardent leur propre licence, notamment FFmpeg
+(LGPL, via JavaCV) pour le lecteur desktop et Media3 (Apache 2.0) pour le lecteur Android. Les listes de chaînes
+proviennent de projets publics (iptv-org, Free-TV) et les flux appartiennent à leurs diffuseurs.
