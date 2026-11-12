@@ -1,0 +1,374 @@
+package com.yamking.iptv
+
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.ImageComposeScene
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.yamking.iptv.resources.Res
+import com.yamking.iptv.resources.app_icon
+import com.yamking.iptv.ui.IptvTheme
+import com.yamking.iptv.ui.Palette
+import org.bytedeco.ffmpeg.global.avcodec
+import org.bytedeco.ffmpeg.global.avutil
+import org.bytedeco.javacv.FFmpegFrameGrabber
+import org.bytedeco.javacv.FFmpegFrameRecorder
+import org.bytedeco.javacv.Frame
+import org.jetbrains.compose.resources.painterResource
+import org.jetbrains.skia.Bitmap
+import org.jetbrains.skia.ColorAlphaType
+import org.jetbrains.skia.ColorType
+import org.jetbrains.skia.Image
+import org.jetbrains.skia.ImageInfo
+import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.ShortBuffer
+import javax.sound.sampled.AudioSystem
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.math.tanh
+import kotlin.test.Test
+
+private const val RATE = 44_100
+private const val FPS = 30
+private const val FADE = 0.5f
+
+/** Une séquence de la vidéo : image (null = carte de titre), textes, voix et durée. */
+private class Sequence(
+    val image: ImageBitmap?,
+    val title: String,
+    val text: String,
+    val phone: Boolean,
+    val voice: ShortArray,
+    val duration: Float,
+) {
+    var start = 0f
+}
+
+class VideoTmp {
+    private fun wav(file: File): ShortArray {
+        val bytes = AudioSystem.getAudioInputStream(file).use { it.readAllBytes() }
+        val samples = ShortArray(bytes.size / 2)
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(samples)
+        // Le fichier se termine par un long silence : on ne garde que la parole.
+        var end = samples.size
+        while (end > 0 && abs(samples[end - 1].toInt()) < 250) end--
+        var begin = 0
+        while (begin < end && abs(samples[begin].toInt()) < 250) begin++
+        return samples.copyOfRange(begin, end)
+    }
+
+    @Test
+    fun presentationWithSound() {
+        val outDir = File(System.getenv("IPTV_VIDEO_OUT") ?: return)
+        val voiceDir = File(System.getenv("IPTV_OUT")!!, "voice")
+        val captures = File(outDir, "captures")
+        fun shot(name: String): ImageBitmap = Image.makeFromEncoded(File(captures, "$name.png").readBytes()).toComposeImageBitmap()
+        val voices = (0..11).map { wav(File(voiceDir, "%02d.wav".format(it))) }
+        fun length(voice: ShortArray, margin: Float, minimum: Float) = maxOf(minimum, voice.size / RATE.toFloat() + margin)
+
+        var v = 0
+        fun card(title: String, text: String, margin: Float) =
+            voices[v++].let { Sequence(null, title, text, false, it, length(it, margin, 3.5f)) }
+        fun slide(name: String, title: String, text: String, phone: Boolean = false) =
+            voices[v++].let { Sequence(shot(name), title, text, phone, it, length(it, 1.1f, 4.5f)) }
+
+        val sequences = listOf(
+            card("IPTV Player", "Toutes vos chaînes TV, vérifiées et organisées", 1.0f),
+            slide("01-bienvenue", "Démarrez en quelques secondes", "Une adresse, un fichier, la liste par défaut ou la recherche automatique."),
+            slide("02-accueil", "Vos chaînes, vérifiées", "Seules les chaînes qui répondent entrent dans votre bibliothèque."),
+            slide("03-accueil-telephone", "Pensée pour le téléphone", "La même bibliothèque, les mêmes favoris, sur Android et Android TV.", phone = true),
+            slide("04-tiroir", "Trouvez vite", "Catégories, pays, langue, favoris, récents et tri.", phone = true),
+            slide("05-lecteur", "Un lecteur complet", "Qualité, pistes audio, plein écran, zapping et reconnexion automatique."),
+            slide("06-liste-par-defaut", "Une liste prête à l'emploi", "1 523 chaînes livrées : importez seulement les catégories qui vous intéressent."),
+            slide("08-recherche", "Recherche automatique", "Par langue et mots-clés, en mode rapide ou en mode lent."),
+            slide("09-sources", "Vous choisissez les sources", "L'application recense les listes, vous cochez celles à fouiller."),
+            slide("10-resultats", "Rien n'entre sans votre accord", "Chaque flux est testé, puis vous validez les chaînes à ajouter."),
+            slide("07-export", "Votre format, vos catégories", "Exportez en .tvlist par catégories, ou en M3U pour d'autres lecteurs."),
+            card("IPTV Player", "Android · Android TV · Windows", 1.8f),
+        )
+        var clock = 0f
+        for (sequence in sequences) {
+            sequence.start = clock
+            clock += sequence.duration
+        }
+        val total = clock
+        println("LIVE timeline total=${total}s " + sequences.joinToString { "%.1f".format(it.duration) })
+
+        val audio = mix(sequences, total)
+        encode(File(outDir, "iptv-player-presentation.mp4"), sequences, total, audio)
+        verify(File(outDir, "iptv-player-presentation.mp4"), sequences)
+    }
+
+    // ---- Son : voix off + musique d'ambiance composée par le programme --------------------------
+
+    /** Renvoie le son stéréo entrelacé (gauche, droite, gauche…) de toute la vidéo. */
+    private fun mix(sequences: List<Sequence>, total: Float): ShortArray {
+        val frames = (total * RATE).toInt()
+        val voice = FloatArray(frames)
+        // Chaque phrase démarre un tiers de seconde après le début de sa séquence.
+        for (sequence in sequences) {
+            val peak = sequence.voice.maxOf { abs(it.toInt()) }.coerceAtLeast(1)
+            val gain = 0.92f / peak
+            val offset = ((sequence.start + 0.35f) * RATE).toInt()
+            for (i in sequence.voice.indices) if (offset + i < frames) voice[offset + i] += sequence.voice[i] * gain
+        }
+        // La musique baisse pendant la parole : enveloppe lissée de la voix.
+        val duck = FloatArray(frames)
+        var level = 0f
+        val attack = 1f - exp(-1f / (0.08f * RATE))
+        val release = 1f - exp(-1f / (0.45f * RATE))
+        for (i in 0 until frames) {
+            val target = if (abs(voice[i]) > 0.02f) 1f else 0f
+            level += (target - level) * (if (target > level) attack else release)
+            duck[i] = level
+        }
+        val (left, right) = music(frames)
+        val out = ShortArray(frames * 2)
+        for (i in 0 until frames) {
+            val seconds = i / RATE.toFloat()
+            val fade = min(1f, seconds / 1.5f) * min(1f, (total - seconds) / 3f).coerceAtLeast(0f)
+            val musicGain = (0.50f - 0.33f * duck[i]) * fade
+            out[i * 2] = (tanh(voice[i] * 0.95f + left[i] * musicGain) * 32000).toInt().toShort()
+            out[i * 2 + 1] = (tanh(voice[i] * 0.95f + right[i] * musicGain) * 32000).toInt().toShort()
+        }
+        return out
+    }
+
+    /** Musique d'ambiance : nappe d'accords (la mineur, fa, do, sol), basse et arpège léger, à 96 battements par minute. */
+    private fun music(frames: Int): Pair<FloatArray, FloatArray> {
+        val left = FloatArray(frames)
+        val right = FloatArray(frames)
+        val bar = 2.5 // secondes : quatre temps à 96 bpm
+        val chords = listOf(
+            doubleArrayOf(110.00, 220.00, 261.63, 329.63), // la mineur
+            doubleArrayOf(87.31, 220.00, 261.63, 349.23),  // fa
+            doubleArrayOf(130.81, 196.00, 261.63, 329.63), // do
+            doubleArrayOf(98.00, 196.00, 246.94, 293.66),  // sol
+        )
+        fun add(start: Double, length: Double, frequency: Double, gain: Double, pan: Double, pluck: Boolean) {
+            val first = (start * RATE).toInt()
+            val count = (length * RATE).toInt()
+            for (n in 0 until count) {
+                val index = first + n
+                if (index >= frames) break
+                val t = n / RATE.toDouble()
+                val envelope = if (pluck) exp(-t / 0.22) * min(1.0, t / 0.004)
+                else min(1.0, t / 0.5) * min(1.0, (length - t) / 0.7).coerceAtLeast(0.0)
+                // Deux sinus très légèrement désaccordés donnent de l'épaisseur à la note.
+                val sample = (sin(2 * PI * frequency * t) + 0.5 * sin(2 * PI * frequency * 1.004 * t) +
+                    (if (pluck) 0.25 * sin(2 * PI * frequency * 2 * t) else 0.0)) * envelope * gain
+                left[index] += (sample * (1 - pan)).toFloat()
+                right[index] += (sample * pan).toFloat()
+            }
+        }
+        val bars = (frames / RATE / bar).toInt() + 1
+        for (b in 0 until bars) {
+            val chord = chords[b % chords.size]
+            val start = b * bar
+            add(start, bar + 0.6, chord[0], 0.26, 0.5, pluck = false)                 // basse
+            for (k in 1..3) add(start, bar + 0.6, chord[k], 0.11, 0.25 + 0.25 * (k - 1), pluck = false) // nappe
+            // Arpège en croches sur les notes de l'accord, une octave au-dessus, alternant gauche et droite.
+            val pattern = intArrayOf(1, 2, 3, 2, 1, 3, 2, 3)
+            for (step in 0 until 8) {
+                add(start + step * bar / 8, 0.9, chord[pattern[step]] * 2, 0.085, if (step % 2 == 0) 0.3 else 0.7, pluck = true)
+            }
+        }
+        return left to right
+    }
+
+    // ---- Montage ----------------------------------------------------------------------------
+
+    private fun encode(file: File, sequences: List<Sequence>, total: Float, audio: ShortArray) {
+        val width = 1280
+        val height = 720
+        var time by mutableFloatStateOf(0f)
+        val scene = ImageComposeScene(width, height, Density(1f)) { VideoFrame(sequences, time) }
+
+        val recorder = FFmpegFrameRecorder(file, width, height, 2)
+        recorder.format = "mp4"
+        recorder.frameRate = FPS.toDouble()
+        recorder.videoBitrate = 5_000_000
+        recorder.pixelFormat = avutil.AV_PIX_FMT_YUV420P
+        recorder.videoCodec = avcodec.AV_CODEC_ID_H264
+        recorder.audioCodec = avcodec.AV_CODEC_ID_AAC
+        recorder.sampleRate = RATE
+        recorder.audioBitrate = 192_000
+        recorder.start()
+
+        val info = ImageInfo(width, height, ColorType.BGRA_8888, ColorAlphaType.OPAQUE)
+        val target = Bitmap().apply { allocPixels(info) }
+        val frames = (total * FPS).toInt()
+        val perFrame = RATE / FPS * 2 // échantillons stéréo par image
+        for (frame in 0 until frames) {
+            time = frame / FPS.toFloat()
+            val image = scene.render((time * 1_000_000_000L).toLong())
+            image.readPixels(target, 0, 0)
+            image.close()
+            val pixels = target.readPixels(info, width * 4)!!
+            recorder.recordImage(width, height, Frame.DEPTH_UBYTE, 4, width * 4, avutil.AV_PIX_FMT_BGRA, ByteBuffer.wrap(pixels))
+            val from = frame * perFrame
+            if (from < audio.size) {
+                recorder.recordSamples(RATE, 2, ShortBuffer.wrap(audio, from, min(perFrame, audio.size - from)))
+            }
+        }
+        recorder.stop()
+        recorder.release()
+        scene.close()
+        println("LIVE video ${file.absolutePath} frames=$frames seconds=$total bytes=${file.length()}")
+    }
+
+    /** Relit le fichier produit : présence et durée du son, niveau pendant la voix et entre les phrases. */
+    private fun verify(file: File, sequences: List<Sequence>) {
+        val grabber = FFmpegFrameGrabber(file)
+        grabber.sampleFormat = avutil.AV_SAMPLE_FMT_S16
+        grabber.start()
+        println("LIVE check video=${grabber.videoCodecName} ${grabber.imageWidth}x${grabber.imageHeight} audio=${grabber.audioCodecName} channels=${grabber.audioChannels} rate=${grabber.sampleRate} seconds=${grabber.lengthInTime / 1_000_000.0}")
+        val samples = ArrayList<Short>()
+        while (true) {
+            val frame = grabber.grabSamples() ?: break
+            val buffer = frame.samples[0] as ShortBuffer
+            while (buffer.hasRemaining()) samples += buffer.get()
+        }
+        grabber.close()
+        fun rms(from: Float, to: Float): Double {
+            val a = (from * RATE).toInt() * 2
+            val b = min((to * RATE).toInt() * 2, samples.size)
+            if (b <= a) return 0.0
+            var sum = 0.0
+            for (i in a until b) sum += (samples[i] / 32768.0).let { it * it }
+            return sqrt(sum / (b - a))
+        }
+        println("LIVE check decodedSeconds=${samples.size / 2.0 / RATE}")
+        for (sequence in sequences.take(4)) {
+            val speech = sequence.voice.size / RATE.toFloat()
+            println(
+                "LIVE check séquence à %.1fs : niveau pendant la voix=%.3f, après la voix (musique seule)=%.3f".format(
+                    sequence.start, rms(sequence.start + 0.5f, sequence.start + 0.3f + speech), rms(sequence.start + 0.6f + speech, sequence.start + sequence.duration),
+                )
+            )
+        }
+    }
+
+    @Composable
+    private fun VideoFrame(sequences: List<Sequence>, time: Float) {
+        val current = sequences.lastOrNull { time >= it.start } ?: sequences.first()
+        val local = time - current.start
+        IptvTheme {
+            Box(
+                Modifier.fillMaxSize().background(
+                    Brush.radialGradient(listOf(Color(0xFF241F4D), Palette.Background), center = Offset(640f, 200f), radius = 1100f)
+                )
+            ) {
+                when {
+                    current.image == null -> TitleCard(current, local, last = current === sequences.last())
+                    else -> SlideCard(current, local)
+                }
+            }
+        }
+    }
+
+    /** Opacité d'entrée et de sortie d'une séquence de durée [length] à l'instant [local]. */
+    private fun alphaAt(local: Float, length: Float): Float =
+        minOf(local / FADE, (length - local) / FADE, 1f).coerceIn(0f, 1f)
+
+    @Composable
+    private fun TitleCard(sequence: Sequence, local: Float, last: Boolean) {
+        val progress = local / sequence.duration
+        // La carte de fin reste affichée jusqu'au bout au lieu de s'effacer.
+        val alpha = if (last) (local / FADE).coerceIn(0f, 1f) else alphaAt(local, sequence.duration)
+        Column(
+            Modifier.fillMaxSize().graphicsLayer { this.alpha = alpha; scaleX = 0.96f + 0.04f * progress; scaleY = 0.96f + 0.04f * progress },
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Image(painterResource(Res.drawable.app_icon), null, Modifier.size(150.dp))
+            Spacer(Modifier.height(18.dp))
+            Text(sequence.title, color = Palette.Text, fontSize = 68.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+            Text(sequence.text, color = Palette.TextMuted, fontSize = 26.sp)
+        }
+    }
+
+    @Composable
+    private fun SlideCard(slide: Sequence, local: Float) {
+        val image = slide.image ?: return
+        val alpha = alphaAt(local, slide.duration)
+        val zoom = 1f + 0.03f * (local / slide.duration)
+        val rise = (1f - (local / 0.7f).coerceIn(0f, 1f)) * 24f
+        if (slide.phone) {
+            Row(
+                Modifier.fillMaxSize().padding(horizontal = 110.dp).graphicsLayer { this.alpha = alpha },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f).graphicsLayer { translationY = rise }) {
+                    Text(slide.title, color = Palette.Text, fontSize = 46.sp, fontWeight = FontWeight.Bold, lineHeight = 52.sp)
+                    Spacer(Modifier.height(14.dp))
+                    Text(slide.text, color = Palette.TextMuted, fontSize = 24.sp, lineHeight = 32.sp)
+                }
+                Spacer(Modifier.width(60.dp))
+                Image(
+                    image, null,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxHeight().padding(vertical = 30.dp).width(352.dp)
+                        .graphicsLayer { scaleX = zoom; scaleY = zoom }
+                        .clip(RoundedCornerShape(28.dp)),
+                )
+            }
+        } else {
+            Column(
+                Modifier.fillMaxSize().graphicsLayer { this.alpha = alpha },
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Spacer(Modifier.height(34.dp))
+                Image(
+                    image, null,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.width(928.dp).height(522.dp)
+                        .graphicsLayer { scaleX = zoom; scaleY = zoom }
+                        .clip(RoundedCornerShape(18.dp)),
+                )
+                Spacer(Modifier.height(30.dp))
+                Column(Modifier.graphicsLayer { translationY = rise }, horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(slide.title, color = Palette.Text, fontSize = 36.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+                    Text(slide.text, color = Palette.TextMuted, fontSize = 20.sp)
+                }
+            }
+        }
+    }
+}
